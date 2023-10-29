@@ -1,16 +1,7 @@
 # Library of functions shared by all CI scripts
 
-if test true != "$GITHUB_ACTIONS"
+if test true = "$GITHUB_ACTIONS"
 then
-	begin_group () { :; }
-	end_group () { :; }
-
-	group () {
-		shift
-		"$@"
-	}
-	set -x
-else
 	begin_group () {
 		need_to_end_group=t
 		echo "::group::$1" >&2
@@ -23,26 +14,49 @@ else
 		need_to_end_group=
 		echo '::endgroup::' >&2
 	}
-	trap end_group EXIT
-
-	group () {
-		set +x
-		begin_group "$1"
-		shift
-		# work around `dash` not supporting `set -o pipefail`
-		(
-			"$@" 2>&1
-			echo $? >exit.status
-		) |
-		sed 's/^\(\([^ ]*\):\([0-9]*\):\([0-9]*:\) \)\(error\|warning\): /::\5 file=\2,line=\3::\1/'
-		res=$(cat exit.status)
-		rm exit.status
-		end_group
-		return $res
+elif test true = "$GITLAB_CI"
+then
+	begin_group () {
+		need_to_end_group=t
+		echo -e "\e[0Ksection_start:$(date +%s):$(echo "$1" | tr ' ' _)\r\e[0K$1"
+		trap "end_group '$1'" EXIT
+		set -x
 	}
 
-	begin_group "CI setup"
+	end_group () {
+		test -n "$need_to_end_group" || return 0
+		set +x
+		need_to_end_group=
+		echo -e "\e[0Ksection_end:$(date +%s):$(echo "$1" | tr ' ' _)\r\e[0K"
+		trap - EXIT
+	}
+else
+	begin_group () { :; }
+	end_group () { :; }
+
+	set -x
 fi
+
+group () {
+	group="$1"
+	shift
+	begin_group "$group"
+
+	# work around `dash` not supporting `set -o pipefail`
+	(
+		"$@" 2>&1
+		echo $? >exit.status
+	) |
+	sed 's/^\(\([^ ]*\):\([0-9]*\):\([0-9]*:\) \)\(error\|warning\): /::\5 file=\2,line=\3::\1/'
+	res=$(cat exit.status)
+	rm exit.status
+
+	end_group "$group"
+	return $res
+}
+
+begin_group "CI setup"
+trap "end_group 'CI setup'" EXIT
 
 # Set 'exit on error' for all CI scripts to let the caller know that
 # something went wrong.
@@ -133,6 +147,27 @@ handle_failed_tests () {
 	return 1
 }
 
+create_failed_test_artifacts () {
+	mkdir -p t/failed-test-artifacts
+
+	for test_exit in t/test-results/*.exit
+	do
+		test 0 != "$(cat "$test_exit")" || continue
+
+		test_name="${test_exit%.exit}"
+		test_name="${test_name##*/}"
+		printf "\\e[33m\\e[1m=== Failed test: ${test_name} ===\\e[m\\n"
+		echo "The full logs are in the 'print test failures' step below."
+		echo "See also the 'failed-tests-*' artifacts attached to this run."
+		cat "t/test-results/$test_name.markup"
+
+		trash_dir="t/trash directory.$test_name"
+		cp "t/test-results/$test_name.out" t/failed-test-artifacts/
+		tar czf t/failed-test-artifacts/"$test_name".trash.tar.gz "$trash_dir"
+	done
+	return 1
+}
+
 # GitHub Action doesn't set TERM, which is required by tput
 export TERM=${TERM:-dumb}
 
@@ -173,25 +208,8 @@ then
 	CC="${CC_PACKAGE:-${CC:-gcc}}"
 	DONT_SKIP_TAGS=t
 	handle_failed_tests () {
-		mkdir -p t/failed-test-artifacts
 		echo "FAILED_TEST_ARTIFACTS=t/failed-test-artifacts" >>$GITHUB_ENV
-
-		for test_exit in t/test-results/*.exit
-		do
-			test 0 != "$(cat "$test_exit")" || continue
-
-			test_name="${test_exit%.exit}"
-			test_name="${test_name##*/}"
-			printf "\\e[33m\\e[1m=== Failed test: ${test_name} ===\\e[m\\n"
-			echo "The full logs are in the 'print test failures' step below."
-			echo "See also the 'failed-tests-*' artifacts attached to this run."
-			cat "t/test-results/$test_name.markup"
-
-			trash_dir="t/trash directory.$test_name"
-			cp "t/test-results/$test_name.out" t/failed-test-artifacts/
-			tar czf t/failed-test-artifacts/"$test_name".trash.tar.gz "$trash_dir"
-		done
-		return 1
+		create_failed_test_artifacts
 	}
 
 	cache_dir="$HOME/none"
@@ -199,6 +217,39 @@ then
 	export GIT_PROVE_OPTS="--timer --jobs 10"
 	export GIT_TEST_OPTS="--verbose-log -x --github-workflow-markup"
 	MAKEFLAGS="$MAKEFLAGS --jobs=10"
+	test windows != "$CI_OS_NAME" ||
+	GIT_TEST_OPTS="--no-chain-lint --no-bin-wrappers $GIT_TEST_OPTS"
+elif test true = "$GITLAB_CI"
+then
+	CI_TYPE=gitlab-ci
+	CI_BRANCH="$CI_COMMIT_REF_NAME"
+	CI_COMMIT="$CI_COMMIT_SHA"
+	case "$CI_JOB_IMAGE" in
+	macos-*)
+		CI_OS_NAME=osx;;
+	alpine:*|ubuntu:*)
+		CI_OS_NAME=linux;;
+	*)
+		echo "Could not identify OS image" >&2
+		env >&2
+		exit 1
+		;;
+	esac
+	CI_REPO_SLUG="$CI_PROJECT_PATH"
+	CI_JOB_ID="$CI_JOB_ID"
+	CC="${CC_PACKAGE:-${CC:-gcc}}"
+	DONT_SKIP_TAGS=t
+	handle_failed_tests () {
+		create_failed_test_artifacts
+	}
+
+	cache_dir="$HOME/none"
+
+	runs_on_pool=$(echo "$CI_JOB_IMAGE" | tr : -)
+
+	export GIT_PROVE_OPTS="--timer --jobs $(nproc)"
+	export GIT_TEST_OPTS="--verbose-log -x"
+	MAKEFLAGS="$MAKEFLAGS --jobs=$(nproc)"
 	test windows != "$CI_OS_NAME" ||
 	GIT_TEST_OPTS="--no-chain-lint --no-bin-wrappers $GIT_TEST_OPTS"
 else
@@ -287,5 +338,5 @@ esac
 
 MAKEFLAGS="$MAKEFLAGS CC=${CC:-cc}"
 
-end_group
+end_group "CI setup"
 set -x
